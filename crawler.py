@@ -4,6 +4,7 @@ import os
 from URLManager import URLManager
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
+from SimhashManager import SimhashManager  # assuming the class from before
 
 DATA_FOLDER = "urls_data/raw"
 os.makedirs(DATA_FOLDER, exist_ok=True)
@@ -15,9 +16,25 @@ pages_crawled = 0
 pages_lock = asyncio.Lock()  # protect counter for concurrency
 
 # =======================
-# Worker function
+# Worker functions
 # =======================
-async def crawl_worker(name, url_manager, pages_to_crawl):
+
+def extract_canonical(html):
+    """Return canonical URL if present, else None."""
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.find("link", rel="canonical")
+    if tag and tag.get("href"):
+        return tag["href"].strip()
+    return None
+
+def extract_text(html):
+    """Simple text extraction from HTML for Simhash."""
+    soup = BeautifulSoup(html, "html.parser")
+    for script in soup(["script", "style"]):
+        script.decompose()
+    return soup.get_text(separator=" ", strip=True)
+
+async def crawl_worker(name, url_manager, simhash_manager, pages_to_crawl):
     global pages_crawled
 
     while url_manager.has_pending_urls():
@@ -50,6 +67,22 @@ async def crawl_worker(name, url_manager, pages_to_crawl):
                                 return
 
                             html = await resp.text()
+                            canonical = extract_canonical(html)
+                            if canonical and canonical != url:
+                                print(f"[{name}] Found canonical URL: {canonical} for {url}")
+                                url_manager.add_url(canonical)
+                                url_manager.mark_visited(url)
+                                return
+
+                            # Extract page text for Simhash
+                            page_text = extract_text(html)
+                            is_new = simhash_manager.add_page(url, page_text)
+                            if not is_new:
+                                print(f"[{name}] Skipped near-duplicate page: {url}")
+                                url_manager.mark_visited(url)
+                                return
+
+                            # Save HTML if it's a new page
                             filename = os.path.join(DATA_FOLDER, f"{hash(url)}.html")
                             with open(filename, "w", encoding="utf-8") as f:
                                 f.write(html)
@@ -108,6 +141,9 @@ async def main(pages_to_crawl=50):
     url_manager = URLManager()
     url_manager.load_state()
 
+    simhash_manager = SimhashManager()
+    simhash_manager.load_state()
+
     if not url_manager.has_pending_urls():
         seeds = [
             "https://aplusbloggers.blogspot.com/",
@@ -116,12 +152,16 @@ async def main(pages_to_crawl=50):
             url_manager.add_url(url)
 
     NUM_WORKERS = 5
-    tasks = [crawl_worker(f"Worker-{i+1}", url_manager, pages_to_crawl) for i in range(NUM_WORKERS)]
+    tasks = [
+        crawl_worker(f"Worker-{i+1}", url_manager, simhash_manager, pages_to_crawl)
+        for i in range(NUM_WORKERS)
+    ]
     await asyncio.gather(*tasks)
 
     url_manager.save_state()
+    simhash_manager.save_state()
     print(f"Crawling finished! Total pages crawled: {pages_crawled}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main(pages_to_crawl=100))  
+    asyncio.run(main(pages_to_crawl=100))
