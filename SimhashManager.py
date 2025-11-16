@@ -17,7 +17,6 @@ class SimhashManager:
         self.f = f
         self.hashes = {}  # {page_id: Simhash object}
         self.index = SimhashIndex([], f=self.f, k=self.k)
-        self.load_state()
     
     def compute_hash(self, text):
         """Compute Simhash for a text"""
