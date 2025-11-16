@@ -12,7 +12,7 @@ class URLManager:
     FAILED_FILE = os.path.join(DATA_FOLDER, "failed_urls.json")
     ROBOTS_FOLDER = os.path.join(DATA_FOLDER, "robots_txt")
 
-    def __init__(self, global_queue_maxsize=0):
+    def __init__(self, global_queue_maxsize=0, disable_robots=False):
         os.makedirs(self.DATA_FOLDER, exist_ok=True)
         os.makedirs(self.ROBOTS_FOLDER, exist_ok=True)
         # single global queue for all URLs (unbounded by default)
@@ -25,14 +25,14 @@ class URLManager:
         # robots
         self.robots_txt = {}
         self.robots_lock = asyncio.Lock()
-        self.disable_robots = False
+        self.disable_robots = disable_robots
 
         # global async queue for workers
         # maxsize=0 makes the queue unbounded
         self.global_queue = asyncio.Queue(maxsize=global_queue_maxsize)
         # optional per-domain scrape limiting (kept for compatibility)
         self.domain_scrape_tracker = {}
-        self.domain_scrape_limit = 300
+        self.domain_scrape_limit = 100000
 
     # -----------------------
     # Internal helpers
@@ -44,6 +44,7 @@ class URLManager:
     # Async robots.txt
     # -----------------------
     async def _fetch_robots(self, domain):
+        print(f"Fetching robots.txt for domain: {domain}")
         async with self.robots_lock:
             if domain in self.robots_txt:
                 return self.robots_txt[domain]
@@ -113,7 +114,7 @@ class URLManager:
                 pass
             else:
                 return
-        if not await self.is_allowed(url):
+        if not await self.is_allowed(url) and not self.disable_robots:
             return
 
         # increment tracker and push to global queue
@@ -205,7 +206,8 @@ class URLManager:
 
         if os.path.exists(self.FAILED_FILE):
             with open(self.FAILED_FILE, "r") as f:
-                self.failed_urls = set(json.load(f))
+                failed_urls = set(json.load(f))
+                self.visited.update(failed_urls)
 
         # refill global queue after loading state
         for url in list(self.queued):

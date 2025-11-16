@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from URLManager import URLManager
 from SimhashManager import SimhashManager
 import hashlib
+import random
 
 # =======================
 # Helpers
@@ -24,9 +25,9 @@ URL_MAP_FILE = "urls_data/url_map.json"
 os.makedirs(DATA_FOLDER, exist_ok=True)
 os.makedirs("urls_data", exist_ok=True)
 
-NUM_WORKERS = 350
-TARGET_PAGES = 20000
-SAVE_INTERVAL = 30  # seconds
+NUM_WORKERS = 100
+TARGET_PAGES = 1000
+SAVE_INTERVAL = 10  # seconds
 
 executor = ThreadPoolExecutor(max_workers=NUM_WORKERS*3)
 save_queue = asyncio.Queue()
@@ -39,10 +40,32 @@ url_map = {}
 # =======================
 # Parsing / Extraction
 # =======================
-def extract_canonical(html):
-    soup = BeautifulSoup(html, "html.parser")
+def extract_canonical(soup):
     tag = soup.find("link", rel="canonical")
     return tag["href"].strip() if tag and tag.get("href") else None
+
+
+def is_page_english_by_metadata(soup):
+
+    html_tag = soup.find("html")
+    if html_tag:
+        lang = html_tag.get("lang") or html_tag.get("xml:lang")
+        if lang and lang.lower().startswith("en"):
+            return True
+        else:
+            return False
+
+    # Check <meta http-equiv="content-language">
+    meta = soup.find("meta", attrs={"http-equiv": "content-language"})
+    if meta:
+        lang = meta.get("content", "").lower()
+        if "en" in lang:
+            return True
+        else:
+            return False
+
+    # No definitive metadata → return None (unknown)
+    return None
 
 def extract_text(html):
     soup = BeautifulSoup(html, "html.parser")
@@ -82,7 +105,14 @@ async def disk_writer():
 # =======================# 
 async def crawl_worker(name, url_manager, simhash_manager):
     global pages_crawled, soft_limit_reached
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=random.choice([
+        {"User-Agent": "Mozilla/5.0"}, 
+        {"User-Agent": "Chrome/91.0.4472.124"}, 
+        {"User-Agent": "Safari/537.36"},
+        {"User-Agent": "Edge/18.18363"},
+        {"User-Agent": "Opera/9.80"},
+        {"User-Agent": "Firefox/89.0"}
+        ])) as session:
         while True:
             if soft_limit_reached:
                 break
@@ -95,17 +125,31 @@ async def crawl_worker(name, url_manager, simhash_manager):
             try:
                 print(f"[{name}] Crawling: {url}")
                 async with session.get(url, timeout=10) as resp:
+                    # If status not OK, mark failed
+                    if int(resp.status ) >= 300:
+                        url_manager.mark_failed(url)
+                        print(f"[{name}] Failed {url}: Status {resp.status}")
+                        continue
+
                     if "text/html" not in resp.headers.get("Content-Type", ""):
                         url_manager.mark_visited(url)
                         continue
 
+
                     html = await resp.text()
                     loop = asyncio.get_running_loop()
 
-                    # Canonical URL
-                    canonical = await loop.run_in_executor(None, extract_canonical, html)
-                    if canonical and canonical != url:
-                        await url_manager.add_url(canonical)
+                    # Parse HTML
+                    soup = await loop.run_in_executor(None, BeautifulSoup, html, "html.parser")
+                    # Check canonical URL
+                    canonical_url = await loop.run_in_executor(None, extract_canonical, soup)
+                    if canonical_url and canonical_url != url:
+                        await url_manager.add_url(canonical_url)
+                        url_manager.mark_visited(url)
+                        continue
+                    # Check language metadata
+                    is_english = await loop.run_in_executor(None, is_page_english_by_metadata, soup)
+                    if is_english is False:
                         url_manager.mark_visited(url)
                         continue
 
@@ -168,7 +212,7 @@ def load_url_map():
 # Main
 # =======================
 async def main():
-    url_manager = URLManager()
+    url_manager = URLManager(disable_robots=True)
     await url_manager.load_state()
 
     simhash_manager = SimhashManager()
@@ -179,60 +223,8 @@ async def main():
     # Seed URLs
     if not url_manager.has_pending_urls():
         seeds = [
-        # --- Pakistan News / Media ---
-        "https://www.dawn.com/",
-        "https://www.geo.tv/",
-        "https://www.express.pk/",
-        "https://tribune.com.pk/",
-        "https://www.samaa.tv/",
-        "https://arynews.tv/",
-        "https://www.bolnews.com/",
-        "https://www.thenews.com.pk/",
-        "https://www.pakistantoday.com.pk/",
-        "https://www.radio.gov.pk/",
 
-        # --- Government of Pakistan ---
-        "https://www.pakistan.gov.pk/",
-        "https://www.pbs.gov.pk/",                 # Pakistan Bureau of Statistics
-        "https://www.senate.gov.pk/",
-        "https://na.gov.pk/",                      # National Assembly
-        "https://www.fbr.gov.pk/",
-        "https://www.hec.gov.pk/",
-
-        # --- Global News (Highly Link-Dense) ---
-        "https://www.bbc.com/news",
-        "https://edition.cnn.com/",
-        "https://www.reuters.com/",
-        "https://www.aljazeera.com/",
-        "https://www.nytimes.com/",
-        "https://www.theguardian.com/international",
-        "https://www.wsj.com/",
-        "https://time.com/",
-        "https://www.economist.com/",
-
-        # --- Technology, Companies, Big Personalities ---
-        "https://techcrunch.com/",                 # startups + companies
-        "https://www.theverge.com/",
-        "https://www.wired.com/",
-        "https://www.forbes.com/",
-        "https://www.bloomberg.com/",
-        "https://www.ft.com/",
-        "https://www.crunchbase.com/",             # company data, founders, funding
-        "https://www.linkedin.com/feed/",          # lots of company/person links
-        "https://www.imdb.com/",                   # celebrities, actors
-        "https://en.wikipedia.org/wiki/List_of_Pakistanis",
-        "https://en.wikipedia.org/wiki/List_of_Internet_phenomena",
-        "https://en.wikipedia.org/wiki/List_of_companies_by_market_capitalization",
-
-        # --- Big Social / Trending / Pop Culture (Link-Rich) ---
-        "https://www.youtube.com/trending",
-        "https://twitter.com/explore",
-        "https://www.reddit.com/r/worldnews/",
-        "https://www.reddit.com/r/pakistan/",
-        "https://www.reddit.com/r/news/",
-        "https://www.reddit.com/r/politics/",
-    ]
-
+        ]
         for url in seeds:
             await url_manager.add_url(url)
 
